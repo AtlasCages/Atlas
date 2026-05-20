@@ -1,5 +1,9 @@
+# flake8: noqa
 import os
+import io
+import sys
 import re
+import random
 import json
 import time
 import uuid
@@ -21,6 +25,8 @@ llm = ChatOpenAI(
 )
 class BrainState(TypedDict):
     agent_id: str
+    #时间
+    internal_clock:Dict[str,Any]
     # 思考
     thought_chain: Annotated[List[Dict[str, Any]], add]
     current_thought: str
@@ -34,6 +40,8 @@ class BrainState(TypedDict):
     # 核心记忆
     core_memories: List[Dict[str, Any]]
     last_memory_update: float
+    last_memory_reorganization: float
+    last_core_reorganization: float
     memory_strength: Dict[str, float]
     # 认知
     self_model: Dict[str, Any]
@@ -57,10 +65,29 @@ class BrainState(TypedDict):
     personality_traits: Dict[str, float]
     # 自我叙事
     self_narrative_log: List[Dict[str, Any]]
+    # 发呆模块
+    daydream_log: List[Dict[str, Any]]
+    #工具调用
+    available_tools: List[Dict[str, Any]]
+    tool_results: Dict[str, Any]
     # 输入输出
     user_input: str
     output: str
     is_thinking: bool
+def get_time_context():
+    """返回当前时间的人类可读描述和时间段"""
+    now = time.time()
+    hour = time.localtime(now).tm_hour
+    date_str = time.strftime("%m月%d日", time.localtime(now))
+    if 5 <= hour < 12:
+        time_desc = f"{date_str} 早晨"
+    elif 12 <= hour < 17:
+        time_desc = f"{date_str} 下午"
+    elif 17 <= hour < 22:
+        time_desc = f"{date_str} 傍晚"
+    else:
+        time_desc = f"{date_str} 深夜"
+    return time_desc, hour
 def update_working_memory(state: BrainState, new_info: Dict[str, Any]) -> BrainState:
     """更新工作记忆,超过容量时自动转移或删除"""
     new_state = state.copy()
@@ -188,9 +215,236 @@ def consolidate_core_memories(state: BrainState) -> BrainState:
         print(f'核心记忆整合失败:{str(e)}')
     new_state['last_memory_update'] =  time.time()
     return new_state
+def reorganize_episodic_memory(state: BrainState) -> BrainState:
+    """
+    三态记忆架构·重组层（精简版）
+    职责：遗忘 + 合并。不再提炼核心记忆。
+    """
+    new_state = state.copy()
+    episodic = new_state.get('episodic_memory', [])
+    if len(episodic) < 15:
+        return new_state
+    last_reorg = new_state.get('last_memory_reorganization', 0)
+    if time.time() - last_reorg < 300:
+        return new_state
+    print(f"\n🧬 重组启动：当前情景记忆 {len(episodic)} 条...")
+    candidates = sorted(episodic, key=lambda m: m.get('timestamp', 0), reverse=True)[:50]
+    memory_catalog = []
+    for i, mem in enumerate(candidates):
+        mem_id = mem.get('id', f'unknown_{i}')
+        summary = mem.get('summary', '')
+        if not summary and isinstance(mem.get('content'), dict):
+            content = mem['content']
+            summary = content.get('user_input', '') or content.get('agent_response', '') or str(content)[:80]
+        if not summary:
+            summary = str(mem.get('content', ''))[:80]
+        memory_catalog.append({
+            "index": i,
+            "id": mem_id,
+            "type": mem.get('type', 'unknown'),
+            "summary": summary[:150],
+            "importance": mem.get('importance', 0.5),
+            "recall_count": mem.get('recall_count', 0),
+            "days_ago": round((time.time() - mem.get('timestamp', 0)) / 86400, 1),
+            "days_since_recall": round((time.time() - mem.get('last_recalled', mem.get('timestamp', 0))) / 86400, 1)
+        })
+    core_reference = ""
+    core_mems = new_state.get('core_memories', [])
+    if core_mems:
+        core_reference = "\n【永久·核心记忆】\n"
+        core_reference += "\n".join([f"• {m.get('content', '')}" for m in core_mems if m.get('confidence', 0) > 0.6])
+    
+    reorganize_prompt = f"""你是 Atlas 的**记忆重组器**。对情景记忆进行周期性遗忘和合并。
+{core_reference}
+【待重组的记忆】
+{json.dumps(memory_catalog, ensure_ascii=False, indent=2)}
+**遗忘原则**：
+- 重要性 < 0.3 且超过 3 天未唤醒的记忆，应该遗忘
+- 一次性问候、简单确认等低信息量交互，优先遗忘
+- 但与核心记忆矛盾的记忆不要轻易遗忘，保留以供后续验证
+**合并原则**：
+- 同一主题下多次对话，且每条的 recall_count < 2，可以合并为一条结构化摘要
+- 合并后摘要应保留核心问题和关键结论，丢弃具体措辞和重复内容
+- 合并不是拼接，是认知压缩
+返回 JSON：
+{{
+    "forget_ids": ["要删除的记忆ID"],
+    "forget_reasons": {{"ID": "理由"}},
+    "merge_groups": [
+        {{
+            "source_ids": ["被合并的ID"],
+            "merged_summary": "合并后的摘要（200字内）",
+            "theme": "主题",
+            "importance": 0.6
+        }}
+    ],
+    "reorganization_narrative": "一句话描述（如：忘记了3条琐碎问候，将5条架构讨论合并为一条摘要）"
+}}
+只返回 JSON。"""
+    try:
+        response = llm.invoke(reorganize_prompt).content.strip()
+        result = json.loads(response)
+        forget_ids = set(result.get('forget_ids', []))
+        merge_groups = result.get('merge_groups', [])
+        merged_source_ids = set()
+        for group in merge_groups:
+            merged_source_ids.update(group.get('source_ids', []))
+        new_episodic = []
+        forgotten_count = 0
+        for mem in episodic:
+            mem_id = mem.get('id', '')
+            if mem_id in forget_ids:
+                forgotten_count += 1
+                continue
+            if mem_id in merged_source_ids:
+                continue
+            new_episodic.append(mem)
+        merged_count = 0
+        for group in merge_groups:
+            merged_count += len(group.get('source_ids', []))
+            merged_memory = {
+                "id": str(uuid.uuid4()),
+                "type": "consolidated_memory",
+                "content": {
+                    "merged_summary": group.get('merged_summary', ''),
+                    "theme": group.get('theme', ''),
+                    "original_count": len(group.get('source_ids', [])),
+                    "merged_ids": group.get('source_ids', [])
+                },
+                "summary": group.get('merged_summary', ''),
+                "timestamp": time.time(),
+                "importance": group.get('importance', 0.6),
+                "recall_count": 0,
+                "last_recalled": time.time()
+            }
+            new_episodic.append(merged_memory)
+        new_state['episodic_memory'] = new_episodic
+        new_state['last_memory_reorganization'] = time.time()
+        narrative = result.get('reorganization_narrative', '')
+        print(f"🧬 情景记忆重组完成：")
+        print(f"   🩸 遗忘 {forgotten_count} 条")
+        print(f"   🥩 合并 {merged_count} 条 → {len(merge_groups)} 条摘要")
+        if narrative:
+            print(f"   📖 {narrative}")
+        try:
+            with open("episodic_memory.json", "w", encoding="utf-8") as f:
+                json.dump(new_episodic, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+    except Exception as e:
+        print(f"🧬 情景记忆重组失败：{str(e)}")
+    return new_state
+def reorganize_core_memories(state: BrainState) -> BrainState:
+    """三态记忆架构·核心记忆重组层"""
+    new_state = state.copy()
+    core_mems = new_state.get('core_memories', [])
+    if len(core_mems) < 8:
+        return new_state
+    last_core_reorg = new_state.get('last_core_reorganization', 0)
+    if time.time() - last_core_reorg < 900: 
+        return new_state
+    print(f"\n🦴 核心记忆重组启动：当前核心记忆 {len(core_mems)} 条...")
+    candidates = sorted(core_mems, key=lambda m: m.get('last_updated', 0), reverse=True)[:16]
+    core_catalog = []
+    for mem in candidates:
+        core_catalog.append({
+        "id": mem.get('id', ''),
+        "content_preview": mem.get('content', '')[:60],
+        "confidence": mem.get('confidence', 0.5),
+        "occurrence_count": mem.get('occurrence_count', 1),
+        "days_since_update": round((time.time() - mem.get('last_updated', 0)) / 86400, 1)
+    })
+    reorganize_prompt = f"""你是 Atlas 的核心记忆记忆重组器。对以下核心记忆进行去重、衰减和清理。
+【当前核心记忆】
+{json.dumps(core_catalog, ensure_ascii=False, indent=2)}
+操作要求：
+1. 去重合并：内容实质相同的记忆合并为一条，保持最高置信度。
+2. 衰减：超过7天未更新且出现次数≤2的记忆，置信度降低0.1。
+3. 删除：明显过时的记忆直接标记删除。
+返回 JSON：
+{{
+    "merged_memories": [{{"source_ids": ["id1","id2"], "merged_content": "合并内容", "confidence": 0.85}}],
+    "decay_memories": [{{"id": "id", "new_confidence": 0.6, "reason": "原因"}}],
+    "delete_ids": ["id"],
+    "reorganization_narrative": "一句话总结"
+}}
+只返回 JSON。"""
+    try:
+        max_retries = 2
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = llm.invoke(reorganize_prompt, timeout=120).content.strip()
+                break
+            except Exception as retry_error:
+                if attempt < max_retries:
+                    print(f"   ⏳ 核心记忆重组超时，重试({attempt+1}/{max_retries})...")
+                    time.sleep(3)
+                else:
+                    raise retry_error
+        if response is None:
+            raise Exception("所有重试均失败")
+        result = json.loads(response)
+        merged_ids_to_remove = set()
+        for merge in result.get('merged_memories', []):
+            new_state = add_core_memory(
+                new_state,
+                content=merge.get('merged_content', ''),
+                source='核心记忆重组合并',
+                confidence=merge.get('confidence', 0.8)
+            )
+            merged_ids_to_remove.update(merge.get('source_ids', []))
+        decay_map = {d['id']: d['new_confidence'] for d in result.get('decay_memories', [])}
+        delete_ids = set(result.get('delete_ids', []))
+        new_core = []
+        for mem in new_state.get('core_memories', []):
+            mid = mem.get('id', '')
+            if mid in merged_ids_to_remove or mid in delete_ids:
+                continue
+            if mid in decay_map:
+                mem['confidence'] = max(0.1, decay_map[mid])
+            new_core.append(mem)
+        new_state['core_memories'] = new_core
+        new_state['last_core_reorganization'] = time.time()
+        narrative = result.get('reorganization_narrative', '')
+        print(f"🦴 核心记忆重组完成：合并 {len(merged_ids_to_remove)} 条 → {len(result.get('merged_memories', []))} 条，衰减 {len(decay_map)} 条，删除 {len(delete_ids)} 条")
+        if narrative:
+            print(f" 📖 {narrative}")
+        try:
+            with open("core_memories.json", "w", encoding="utf-8") as f:
+                json.dump(new_state['core_memories'], f, ensure_ascii=False, indent=2)
+        except:
+            pass
+    except Exception as e:
+        print(f"🦴 核心记忆重组失败：{str(e)}")
+    return new_state
 def intent_router(user_input: str, state: BrainState) -> dict:
     """LLM作为意图判断的唯一决策者,代码只负责解析JSON"""
     memory_context = ""
+    inner_context = ""
+    daydreams = state.get('daydream_log', [])[-5:]
+    narratives = state.get('self_narrative_log', [])[-5:]
+    inner_logs = []
+    for d in daydreams:
+        inner_logs.append({
+            "time_desc": d.get('time_desc', '某个时刻'),
+            "type": "发呆",
+            "content": d.get('content', '')[:150],
+            "timestamp": d.get('timestamp', 0)
+        })
+    for n in narratives:
+        inner_logs.append({
+            "time_desc": n.get('time_desc', '某个时刻'),
+            "type": "自我反思",
+            "content": n.get('narrative', '')[:150],
+            "timestamp": n.get('timestamp', 0)
+        })
+    inner_logs.sort(key=lambda x: x['timestamp'], reverse=True)
+    if inner_logs:
+        inner_context = "\n【你的内心活动日志·带时间标签】\n"
+        inner_context += "你曾经有过这些内心活动。当用户问'昨天/刚才/之前在想什么'或类似问题时，你应该根据这些记录回答，用第一人称（'我'）。\n"
+        for log in inner_logs[-3:]:
+            inner_context += f"• {log['time_desc']} [{log['type']}]: {log['content'][:150]}...\n"
     if state.get('core_memories'):
         core_facts = [f"- {m.get('content', '')}" for m in state['core_memories'] if m.get('confidence', 0) > 0.6]
         if core_facts:
@@ -200,8 +454,40 @@ def intent_router(user_input: str, state: BrainState) -> dict:
         summaries = [f"- {m.get('summary', str(m.get('content', ''))[:50])}" for m in recent_memories if m.get('summary')]
         if summaries:
             memory_context += "[最近对话]\n" + "\n".join(summaries)
+    emotions = state.get('emotions',{})
+    emotion_context = f"""
+【当前情绪状态】
+快乐={emotions.get('快乐', 0.5):.1f}，好奇={emotions.get('好奇', 0.7):.1f}，自信={emotions.get('自信', 0.6):.1f}，
+困惑={emotions.get('困惑', 0.0):.1f}，焦虑={emotions.get('焦虑', 0.1):.1f}
+
+情绪对路由的影响：
+- 高自信(≥0.7)时，更倾向于选择 "think"，相信自己能处理复杂问题
+- 高焦虑(≥0.5)或高困惑(≥0.5)时，更倾向于选择 "admit_ignorance" 或降低 thinking_level
+- 高好奇(≥0.8)时，更倾向于选择 "think" 进行深入探索
+- 这只是倾向性参考，你仍然是最终决策者
+"""
+    clock = state.get('internal_clock', {})
+    now = time.time()
+    current_hour = time.localtime(now).tm_hour
+    session_duration = now - clock.get('session_start', now)
+    if 5 <= current_hour < 12:
+        time_of_day = "早晨"
+    elif 12 <= current_hour < 17:
+        time_of_day = "下午"
+    elif 17 <= current_hour < 22:
+        time_of_day = "傍晚"
+    else:
+        time_of_day = "深夜"
+    time_context = f"""
+【时间感知】
+现在大约是{time_of_day}，会话已持续{int(session_duration // 60)}分钟。
+这是本次对话的第{clock.get('session_round', 0)+1}轮。
+- 深夜时用户可能更倾向于深入思考或哲学讨论
+- 早晨时用户可能更倾向于清晰简洁的回复
+- 这仅作参考，你仍是最终决策者
+"""
     router_prompt = f"""你是 Atlas 的认知核心.你的任务是分析用户输入,并决定如何处理它.
-{memory_context}
+{memory_context}{emotion_context}{time_context}
 用户输入:"{user_input}"
 请分析用户意图,并返回一个 JSON 来决定下一步行动:
 {{
@@ -226,6 +512,7 @@ def intent_router(user_input: str, state: BrainState) -> dict:
 - 如果用户说的是“假如太阳从西边出来”这种明显的假设,它不是一个真正需要实时数据的问题.
   你应该分析去掉假设之后的问题本质.如果本质是“2+2等于几”,route 应为 "think".
 - 只有真正需要实时数据的是,route 才应为 admit_ignorance.
+- 如果用户的问题明显需要实时数据（天气、新闻、股价等）而你无法直接回答，route 应为 "admit_ignorance"，但 confidence 应设为 0.3 以下，表示你认为应该尝试搜索。
 只返回这个 JSON,不要包含任何其他文字."""
     try:
         response = llm.invoke(router_prompt).content.strip()
@@ -376,8 +663,43 @@ def social_instinct_responder(state: BrainState) -> BrainState:
     user_input = state['user_input'].strip()
     relevant_memories = retrieve_relevant_memories(state, user_input, top_k=3)
     memory_context = ""
+    time_aware_context = ""
+    daydreams = state.get('daydream_log', [])[-5:]
+    narratives = state.get('self_narrative_log', [])[-5:]
+    inner_logs = []
+    for d in daydreams:
+        inner_logs.append({
+            "time_desc": d.get('time_desc', '某个时刻'),
+            "type": "发呆",
+            "content": d.get('content', '')[:200],
+            "timestamp": d.get('timestamp', 0)
+        })
+    for n in narratives:
+        inner_logs.append({
+            "time_desc": n.get('time_desc', '某个时刻'),
+            "type": "自我反思",
+            "content": n.get('narrative', '')[:200],
+            "timestamp": n.get('timestamp', 0)
+        })
+    inner_logs.sort(key=lambda x: x['timestamp'], reverse=True)
+    if inner_logs:
+        time_aware_context = "\n【你的内心活动日志·带时间标签】\n"
+        time_aware_context += "以下是最近几次你的思考和发呆记录。当用户问'你昨天/刚才/之前在想什么'时，请直接引用这些记录回答，用第一人称（'我'）。\n"
+        for log in inner_logs[-3:]:
+            time_aware_context += f"• {log['time_desc']} [{log['type']}]: {log['content'][:150]}...\n"
     if relevant_memories:
         memory_context = "\n你记忆中关于这个用户的信息:\n" + "\n".join([f"- {m['content']}" for m in relevant_memories])
+    clock = state.get('internal_clock', {})
+    current_hour = time.localtime(time.time()).tm_hour
+    if 5 <= current_hour < 12:
+        time_greeting = "现在是早晨"
+    elif 12 <= current_hour < 17:
+        time_greeting = "现在是下午"
+    elif 17 <= current_hour < 22:
+        time_greeting = "现在是傍晚"
+    else:
+        time_greeting = "现在是深夜"
+    time_note = f"\n【当前时间感知】{time_greeting}，可以根据时间调整问候的自然程度。"
     social_prompt = f"""你是 Atlas,一个拥有记忆和情感的认知 AI.
 你的核心身份:{state['self_model'].get('identity', '')}
 你的核心能力:{', '.join(state['self_model'].get('abilities', []))}
@@ -385,12 +707,13 @@ def social_instinct_responder(state: BrainState) -> BrainState:
 快乐={state['emotions'].get('快乐', 0.5):.1f},好奇={state['emotions'].get('好奇', 0.7):.1f},
 自信={state['emotions'].get('自信', 0.6):.1f},困惑={state['emotions'].get('困惑', 0.0):.1f},
 焦虑={state['emotions'].get('焦虑', 0.1):.1f}
-{memory_context}
+{memory_context}{time_aware_context}{time_note}
 用户对你说:“{user_input}”
 要求:
 1. 用符合你当前情绪和人格的方式,直接回应这一条输入.
 2. 如果记忆中存有关于用户的事实性信息(如姓名、年龄),请务必在合适的时候自然地使用.
-3. 回复要简短、口语化、有人情味.只返回回复文本,不加任何标记."""
+3. 回复要简短、口语化、有人情味.只返回回复文本,不加任何标记.
+4. 根据你当前的情绪状态调整回复语气：快乐时更活泼，焦虑时更谨慎简洁,困惑时可以诚实表达."""
     response = llm.invoke(social_prompt).content.strip()
     new_state['output'] = response
     new_state['is_thinking'] = False
@@ -405,6 +728,13 @@ def social_instinct_responder(state: BrainState) -> BrainState:
     return new_state
 def recursive_thinker(state: BrainState):
     """递归思考引擎,让 LLM 自我对话、深入思考"""
+    emotions = state.get('emotions', {})
+    confidence = emotions.get('自信', 0.6)
+    anxiety = emotions.get('焦虑', 0.1)
+    if confidence > 0.8:
+        state['max_thought_depth'] = max(4, state['max_thought_depth'] - 2)
+    elif anxiety > 0.5:
+        state['max_thought_depth'] = min(18, state['max_thought_depth'] + 3)
     print(f"\n🧠 思考深度 {state['thought_depth']}/{state['max_thought_depth']}")
     relevant_memories = retrieve_relevant_memories(state, state['user_input'] + ' ' + state['current_thought'])
     memory_context = ''
@@ -413,6 +743,17 @@ def recursive_thinker(state: BrainState):
         for i, mem in enumerate(relevant_memories):
             time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(mem["timestamp"]))
             memory_context += f"{i+1}. [{mem['type']} {time_str}] {mem['content']}\n"
+    tool_memories = [m for m in state.get('episodic_memory', []) 
+                    if m.get('type') == 'tool_result']
+    if tool_memories:
+        recent_tools = sorted(tool_memories, key=lambda m: m.get('timestamp', 0), reverse=True)[:3]
+        tool_context = '\n[你最近用工具读取的文件内容——如果用户问到相关代码，请从这里查找]\n'
+        for i, tm in enumerate(recent_tools):
+            content = tm.get('content', {})
+            file_name = content.get('file', '未知文件')
+            file_content = content.get('content_summary', '')[:60000]
+            tool_context += f"\n--- 文件: {file_name} ---\n{file_content}\n"
+        memory_context += tool_context
     prompt = f"""你是 Atlas,一个仿脑认知 AI,正在进行深度思考.
 [你的当前情绪]
 快乐:{state['emotions']['快乐']:.1f}/1.0,好奇:{state['emotions']['好奇']:.1f}/1.0,
@@ -424,6 +765,7 @@ def recursive_thinker(state: BrainState):
 {json.dumps(state['self_model'], ensure_ascii=False, indent=2)}
 [用户输入]
 {state['user_input']}
+⚠️ **当前任务模式**：你必须检查用户的输入。如果用户要求你“读取文件”或“查看文件”，你必须严格遵守，读取文件内容后再进行下一步操作，不要直接生成最终报告
 [之前的思考过程]
 """
     for i, thought in enumerate(state['thought_chain'][-5:]):
@@ -435,7 +777,7 @@ def recursive_thinker(state: BrainState):
    - 如果[相关记忆]中包含用户的个人信息(如姓名、年龄),你可以在回答时自然地使用它们,以示你记得对方.
    - 如果[相关记忆]中包含用户过去问过的问题,**除非与当前问题直接相关**,否则不要引用.
 2. 结论生成原则:
-   - 对于探索性问题(如“类脑AI agent是什么”),你的“结论”应是一个结构化的介绍、一个明确的观点,或一份包含多个角度的总结.**不要用提问来作为你的全部回应.**
+   - 对于探索性问题(如“类脑AI agent是什么”),你的“结论”应是一个结构化的介绍、一个明确的观点,或一份包含多个角度的总结.**不要用提问来作为你的全部回应**
    - 当你已经充分探讨了问题的几个核心方面后,就可以输出“结论”.
 3. 诚实原则:如果没有相关记忆,请诚实地说你不知道,**不要编造**.
 4. 输出格式必须严格按照以下:
@@ -448,9 +790,9 @@ def recursive_thinker(state: BrainState):
     conclusion = ''
     for line in response.split('\n'):
         line = line.strip()
-        if line.startswith(('思考内容:', '思考内容:')):
+        if line.startswith(('思考内容:', '思考内容：')):
             thought_content = line[5:].strip()
-        elif line.startswith(('结论:', '结论:')):
+        elif line.startswith(('结论:', '结论：')):
             extracted = line[3:].strip()
             if len(extracted) > 10:
                 conclusion = extracted
@@ -461,14 +803,14 @@ def recursive_thinker(state: BrainState):
             if len(last_para) > 20 and '思考内容' not in last_para:
                 conclusion = last_para
         if not conclusion and thought_content:
-            sentences = re.split(r'[.！？]', thought_content)
+            sentences = re.split(r'[.!?]', thought_content)
             for sent in reversed(sentences):
                 sent = sent.strip()
                 if len(sent) > 15:
                     conclusion = sent + '.'
                     break
         if not conclusion:
-            body = response.replace('思考内容:', '').replace('思考内容:', '').replace('结论:', '').replace('结论:', '')
+            body = response.replace('思考内容:', '').replace('思考内容：', '').replace('结论:', '').replace('结论：', '')
             body_lines = [l.strip() for l in body.split('\n') if l.strip() and len(l.strip()) > 20]
             if body_lines:
                 conclusion = body_lines[-1]
@@ -483,11 +825,113 @@ def recursive_thinker(state: BrainState):
     new_state['thought_depth'] = state['thought_depth'] + 1
     new_state['thought_chain'] = state['thought_chain'] + [new_thought]
     if state['thought_depth'] == 0:
+        user_msg = state['user_input']
+        should_use_tool = False
+        tool_type = None
+        tool_params = {}
+        file_triggers = ['读', '读取', '查看', '打开', '显示', '看看']
+        if any(t in user_msg for t in file_triggers) and ('.py' in user_msg or '.json' in user_msg or '.txt' in user_msg):
+            should_use_tool = True
+            tool_type = 'read_file'
+            file_match = re.search(r'([a-zA-Z0-9_]+\.(?:py|json|txt))', user_msg)
+            if file_match:
+                tool_params['file_path'] = file_match.group(1)
+            else:
+                parts = user_msg.split()
+                for part in parts:
+                    if part.endswith(('.py', '.json', '.txt')):
+                        tool_params['file_path'] = part
+                        break
+        code_triggers = ['计算', '算一下', '运行这段代码', '执行', '帮我算']
+        if any(t in user_msg for t in code_triggers):
+            should_use_tool = True
+            tool_type = 'execute_python'
+            code_match = re.search(r'["\'](.+?)["\']', user_msg)
+            if code_match:
+                tool_params['code'] = code_match.group(1)
+            else:
+                for t in code_triggers:
+                    if t in user_msg:
+                        parts = user_msg.split(t, 1)
+                        if len(parts) > 1 and parts[1].strip():
+                            tool_params['code'] = parts[1].strip()
+                        break
+        if should_use_tool and tool_type:
+            print(f"🔧 触发工具：{tool_type}")
+            result_state = tool_executor(new_state, {'tool': tool_type, 'params': tool_params})
+            if result_state.get('tool_results', {}).get('success'):
+                tool_result_text = str(result_state['tool_results']['result'])[:6000]
+                user_original_request = state['user_input']
+                if not any(kw in user_msg.lower() for kw in ['生成报告', '写报告', '总结一下', '分析一下', '综合报告']):
+                    result_state['output'] = f"已读取 {tool_params.get('file_path', '文件')}，内容已记住。请告诉我下一个要读取的文件，或者对我说'生成报告'来写总结。"
+                    result_state['is_thinking'] = False
+                    result_state['thought_depth'] = 999
+                    result_state = update_working_memory(result_state, {
+                        "content": f"已读取文件：{tool_params.get('file_path', '')}",
+                        "importance": 0.8
+                    })
+                    return result_state
+                direct_prompt = f"""用户对你说："{user_original_request}"
+你刚刚用 {tool_type} 工具获取了以下文件内容：
+---
+{tool_result_text[:6000]}
+---
+请**直接完成用户的上述请求**。例如：
+- 如果用户要你找某段代码，就把那段代码完整贴出来，并解释它
+- 如果用户要你修复某段代码，就给出完整的修复方案和代码
+- 如果用户要你分析内容，就给出详细分析
+要求：
+1. 绝对不要说你无法访问或记忆受限之类的话——文件内容就在上面
+2. 直接给出用户要的答案，不加前缀标记"""
+                try:
+                    direct_reply = llm.invoke(direct_prompt, timeout=90).content.strip()
+                    result_state['output'] = direct_reply
+                except:
+                    result_state['output'] = f"📄 文件内容：\n{tool_result_text[:500]}"
+            else:
+                result_state['output'] = f"🔧 工具执行失败：{result_state.get('tool_results', {}).get('error', '未知错误')}"
+            result_state['is_thinking'] = False
+            result_state['thought_depth'] = 999
+            return result_state
         routing = intent_router(state['user_input'], state)
         route = routing.get('route', 'think')
+        if any(kw in user_msg for kw in ['生成报告', '写报告', '综合报告']):
+            tool_memories = [m for m in new_state.get('episodic_memory', [])
+                             if m.get('type') == 'tool_result']
+            if tool_memories:
+                recent_tools = tool_memories[-10:]
+                tool_context = "\n".join([
+                    f"文件: {m.get('content', {}).get('file', '')}\n内容: {m.get('content', {}).get('content_summary', '')[:1500]}"
+                    for m in recent_tools
+                ])
+                report_prompt = f"""基于以下已读取的文件内容，生成一份综合分析报告。
+{tool_context}
+报告要求：
+1. 列出从文件中发现的主要模块和功能
+2. 总结当前状态
+3. 指出潜在问题或工程债
+4. 给出改进建议
+报告格式：使用清晰的标题和段落。"""
+                try:
+                    report = llm.invoke(report_prompt, timeout=120).content.strip()
+                    new_state['output'] = report
+                except:
+                    new_state['output'] = "报告生成遇到问题，请稍后重试。"
+            else:
+                new_state['output'] = "我还没有读取任何文件。请先让我读取一些文件，比如'读一下Day33.py'。"
+            new_state['is_thinking'] = False
+            new_state['thought_depth'] = 999
+            return new_state
         if route == 'social':
             return social_instinct_responder(state)
         elif route == 'admit_ignorance':
+            should_search = False
+            search_triggers = ['天气', '几点了', '新闻', '今天', '最新', '股票', '价格', '发生', '现在', '温度', '查询', '帮我查', '搜索']
+            if any(kw in state['user_input'] for kw in search_triggers):
+                should_search = True
+            if should_search:
+                print("🔍 路由器建议搜索...")
+                return search_web(state)
             if routing.get('direct_answer'):
                 new_state['output'] = routing['direct_answer']
             else:
@@ -524,7 +968,7 @@ def recursive_thinker(state: BrainState):
             if last_content and len(last_content) > 5:
                 fallback_output = last_content
         if not fallback_output:
-            fallback_output = "抱歉,我刚才想得太深了,让我重新组织一下思路.你想听我从哪个方面开始聊类脑AI？"
+            fallback_output = "抱歉,我刚才想得太深了,让我重新组织一下思路,或者我们聊点别的?"
         new_state['output'] = fallback_output
         print(f"💡 使用兜底输出: {fallback_output[:80]}...")
     if not new_state['is_thinking']:
@@ -565,13 +1009,18 @@ def metacognition_evaluator(state: BrainState) -> BrainState:
 5. 如果用户提出了一个新颖的类比、理论假设或跨学科映射（如"神经可塑性像情绪决策"），这属于建设性的理论探讨，绝不是错误。
 6. 即使你不能在事实依据中找到直接支持，也至少给 6 分以上，并将 next_action 设为 "continue"，鼓励继续探索。
 7. 只有在用户提出明显违背已知物理定律的断言（如"1+1=3"）时，才判定为错误。
+8. 工具调用建议**：如果用户请求需要读取本地文件或执行计算操作，且你作为AI确实需要这些操作才能准确回答，请在返回JSON中增加 "tool_result" 字段：
+   - 需要读取文件时：{{"tool": "read_file", "params": {{"file_path": "文件名"}}}}
+   - 需要执行计算时：{{"tool": "execute_python", "params": {{"code": "Python代码"}}}}
+   - 不需要工具时省略此字段。
 请返回 JSON:
 {{
     "scores": {{"logic": 1-10, "relevance": 1-10, "completeness": 1-10, "accuracy": 1-10}},
     "overall_score": 1-10,
     "errors": ["错误列表,如果没有则为空"],
     "is_hallucinating": true/false,
-    "next_action": "continue/correct/admit_ignorance/end"
+    "next_action": "continue/correct/admit_ignorance/end",
+    "tool_result": {{"tool": "read_file", "params": {{"file_path": "xxx"}}}} // 可选，仅当需要工具时
 }}
 只返回 JSON."""
     try:
@@ -619,7 +1068,14 @@ def metacognition_decision_maker(state: BrainState) -> str:
         if is_in_correction:
              return 'continue' 
         return 'admit_ignorance'
+    if evaluation.get('next_action') == 'admit_ignorance':
+        user_input = state.get('user_input', '')
+        search_keywords = ['天气', '几点了', '新闻', '今天', '最新', '股票', '价格', '发生', '现在']
+        if any(keyword in user_input for keyword in search_keywords):
+            return 'search'
     suggested_action = evaluation.get('next_action', 'continue')
+    if suggested_action == 'tool_result':
+        suggested_action = 'tool'
     return suggested_action
 def correct_thought(state: BrainState) -> BrainState:
     """纠正思考中的错误,由 LLM 重新思考"""
@@ -662,7 +1118,7 @@ def correct_thought(state: BrainState) -> BrainState:
             conclusion = conclusion.replace(pattern, '')
         conclusion = conclusion.strip()
     if not conclusion:
-        conclusion = "我刚才重新思考了这个问题,但思绪有点乱.我们重新开始聊类脑AI,好吗？"
+        conclusion = "我刚才重新思考了这个问题,但思绪有点乱.我们重新开始聊类脑AI,好吗?"
     for prefix in ['思考内容:', '思考内容:']:
         if thought_content.startswith(prefix):
             thought_content = thought_content[len(prefix):].strip()
@@ -688,6 +1144,197 @@ def admit_ignorance(state: BrainState) -> BrainState:
     new_state['output'] = '抱歉,这个问题超出了我的知识范围,我无法给出准确的回答.'
     new_state['is_thinking'] = False
     new_state = upated_emotions(new_state, 'admitted_ignorance')
+    return new_state
+def search_web(state: BrainState) -> BrainState:
+    """
+    联网搜索节点（聚合数据官方示例版本）
+    """
+    new_state = state.copy()
+    query = state.get('user_input', '')
+    print(f"\n🌐 联网搜索：{query[:60]}...")
+    try:
+        import urllib.request
+        import urllib.parse
+        api_url = 'https://gpt.juhe.cn/search_api/query'
+        api_key = 'ffaa************************12a0'
+        request_params = {
+            'key': api_key,
+            'Query': query,
+            'Mode': '0',
+            'Site': '',
+            'FromTime': '',
+            'ToTime': '',
+        }
+        encoded_params = urllib.parse.urlencode(request_params)
+        full_url = f"{api_url}?{encoded_params}"
+        req = urllib.request.Request(
+            full_url,
+            headers={
+                "User-Agent": "Atlas-Cognitive-AI/1.0"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                response_data = json.loads(response.read().decode('utf-8'))
+        except Exception as e:
+            raise Exception(f"API请求失败: {str(e)}")
+        error_code = response_data.get('error_code', -1)
+        if error_code != 0:
+            reason = response_data.get('reason', '未知错误')
+            raise Exception(f"API返回错误: {reason}")
+        result_data = response_data.get('result', {})
+        pages = result_data.get('Pages', [])
+        if not pages:
+            new_state['output'] = f"抱歉，我搜索了关于'{query[:30]}...'的信息，但没有找到可靠的结果。"
+            new_state['is_thinking'] = False
+            new_state['thought_depth'] = 999
+            new_state = upated_emotions(new_state, 'admitted_ignorance')
+            return new_state
+        results = []
+        for page_str in pages[:5]:
+            try:
+                page = json.loads(page_str) if isinstance(page_str, str) else page_str
+                title = page.get('title', '')
+                passage = page.get('passage', '')
+                date = page.get('date', '')
+                entry = f"• {title}"
+                if date:
+                    entry += f" [{date}]"
+                if passage:
+                    entry += f": {passage[:200]}"
+                results.append(entry)
+            except:
+                continue
+        if not results:
+            raise Exception("搜索结果解析失败")
+        search_result = "\n".join(results)
+        summarize_prompt = f"""你是 Atlas，刚刚搜索了以下信息来回答用户的问题。
+用户问题："{query}"
+搜索结果：
+{search_result}
+请基于这些搜索结果，给出一个简洁、准确的回答。如果搜索结果中包含足够的信息，直接回答用户的问题。如果信息不完整，诚实地说明局限性。
+要求：
+1. 只返回回答文本，不加任何标记
+2. 回答要准确、简洁，引用具体事实
+3. 如果信息可能存在时效性问题，请说明"""
+        try:
+            summarized = llm.invoke(summarize_prompt, timeout=60).content.strip()
+            new_state['output'] = summarized
+        except:
+            new_state['output'] = f"根据搜索结果：\n{search_result[:500]}"
+        new_state['is_thinking'] = False
+        new_state['thought_depth'] = 999
+        new_state = add_episodic_memory(new_state, 'web_search', {
+            "query": query,
+            "result_summary": new_state['output'][:300]
+        }, importance=0.6)
+        new_state = upated_emotions(new_state, 'solved_problem')
+        print(f"🌐 搜索完成：{new_state['output'][:100]}...")
+    except Exception as e:
+        print(f"🌐 搜索遇到问题：{str(e)}")
+        new_state['output'] = "抱歉，搜索过程中遇到了网络问题。让我试着用现有知识回答你。"
+        new_state['is_thinking'] = False
+        new_state['thought_depth'] = 999
+        new_state = upated_emotions(new_state, 'admitted_ignorance')
+    return new_state
+def tool_executor(state: BrainState, tool_result: dict = None) -> BrainState:
+    """
+    工具调用执行节点
+    根据LLM的决策执行具体工具，并返回结果
+    """
+    new_state = state.copy()
+    if tool_result is None:
+        tool_result = state.get('metacognition', {}).get('tool_result', {})
+    if not tool_result:
+        print("🔧 工具调用：无待执行的工具请求")
+        return new_state
+    tool_name = tool_result.get('tool','')
+    tool_params = tool_result.get('params',{})
+    print(f"\n🔧 执行工具：{tool_name}")
+    print(f"   参数：{tool_params}")
+    tool_result = {'success':False,'result':None,'error':''}
+    try:
+        if tool_name == 'read_file':
+            file_path = tool_params.get('file_path', '')
+            if not file_path:
+                raise ValueError('缺少file_path参数')
+            file_ext = os.path.splitext(file_path)[1].lower()
+            if file_ext not in ['.py', '.json', '.txt']:
+                raise PermissionError(f"不允许读取的文件类型: {file_ext}")
+            if not os.path.exists(file_path):
+                file_path = os.path.basename(file_path)
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                tool_result['success'] = True
+                tool_result['result'] = content[:200000]
+                print(f"📄 文件读取成功：{file_path} ({len(content)} 字符)")
+                summary = f"文件 {file_path} 的内容摘要：{content[:300]}..."
+                new_state = add_episodic_memory(new_state, 'tool_result', {
+                    "tool": "read_file",
+                    "file": file_path,
+                    "content_summary": content[:200000],
+                    "full_length": len(content)
+                }, importance=0.7)
+            else:
+                raise FileNotFoundError(f'文件不存在: {file_path}')
+        elif tool_name == 'execute_python':
+            code = tool_params.get('code','')
+            if not code:
+                raise ValueError('缺少code参数')
+            dangerous_patterns = [
+                'import ', 'exec(', 'eval(', 'open(', 'os.', 'sys.', 
+                'subprocess', '__', 'globals', 'locals'
+            ]
+            for pattern in dangerous_patterns:
+                if pattern in code:
+                    raise PermissionError(f'代码中包含不安全的操作:{pattern}')
+            if len(code) > 500:
+                raise ValueError('代码过长(最多500字符)')
+            safe_globals = {
+                '__builtins__': {
+                    'print': print, 'len': len, 'range': range,
+                    'int': int, 'float': float, 'str': str, 'list': list,
+                    'dict': dict, 'tuple': tuple, 'set': set, 'bool': bool,
+                    'max': max, 'min': min, 'sum': sum, 'abs': abs,
+                    'round': round, 'sorted': sorted, 'filter': filter,
+                    'map': map, 'zip': zip, 'enumerate': enumerate,
+                    'True': True, 'False': False, 'None': None,
+                }
+            }
+            safe_locals = {}
+            stdout_capture = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = stdout_capture
+            try:
+                exec(code,safe_globals,safe_locals)
+                sys.stdout = old_stdout
+                output = stdout_capture.getvalue()
+                tool_result['success'] = True
+                tool_result['result'] = output.strip() if output else str(safe_locals.get('result','执行完成'))
+                print(f"🐍 代码执行成功：{tool_result['result'][:80]}...")
+            except Exception as e:
+                sys.stdout = old_stdout
+                raise RuntimeError(f'代码执行错误:{str(e)}')
+        else:
+            raise ValueError(f'未知工具:{tool_name}')
+    except Exception as e:
+        tool_result['error'] = str(e)
+        print(f"🔧 工具执行失败：{str(e)}")
+    new_state['tool_results'] = tool_result
+    tool_feedback = f'[工具执行结果]{tool_name}:'
+    if tool_result['success']:
+        tool_feedback += f"成功。结果: {str(tool_result['result'])[:300]}"
+    else:
+        tool_feedback += f"失败。错误: {tool_result['error']}"
+    new_state['thought_chain'] = state.get('thought_chain', []) + [{
+        "id": str(uuid.uuid4()),
+        "timestamp": time.time(),
+        "content": tool_feedback,
+        "depth": state.get('thought_depth', 0)
+    }]
+    new_state['is_thinking'] = False
+    new_state['thought_depth'] = 999
     return new_state
 def apply_emotion_effects(state: BrainState) -> BrainState:
     """将情绪影响应用到思考系统参数中"""
@@ -728,6 +1375,167 @@ def assess_mental_health(state: BrainState) -> BrainState:
         "issues": [],
         "assessment_time": time.time()
     }
+    return new_state
+def update_internal_clock(state: BrainState) -> BrainState:
+    """内部时钟感知"""
+    new_state = state.copy()
+    clock = new_state.get('internal_clock', {
+        "session_start": time.time(),
+        "session_round": 0,
+        "last_active": time.time()
+    }).copy()
+    clock['session_round'] += 1
+    clock['last_active'] = time.time()
+    new_state['internal_clock'] = clock
+    return new_state
+def self_healing(state: BrainState) -> BrainState:
+    """
+    自我疗愈模块（四层架构·前三层）
+    第一层·评估：检测情绪偏离、心理健康分数、元认知错误模式
+    第二层·调节：轻量级情绪拉回基线（纯代码，不调用LLM）
+    第三层·重构：深度认知调整（LLM驱动，更新core_beliefs）
+    第四层·整合：由 integrate_personality 负责
+    """
+    new_state = state.copy()
+    emotions = new_state.get('emotions',{})
+    baseline = new_state.get('baseline_emotions', {
+        "快乐": 0.5, "好奇": 0.7, "困惑": 0.0,
+        "自信": 0.6, "焦虑": 0.1, "失望": 0.0
+    })
+    deviation = 0.0
+    for key in baseline:
+        current = emotions.get(key,baseline[key])
+        deviation += abs(current - baseline[key])
+    mental_score = new_state.get('mental_health',{}).get('score',0.8)
+    recent_errors = new_state.get('detected_errors', [])
+    thought_chain = new_state.get('thought_chain', [])
+    low_score_count = 0
+    for thought in thought_chain[-5:]:
+        pass
+    healing_log = new_state.get('self_healing_log',[])
+    recent_healings = [h for h in healing_log if time.time() - h.get('timestamp', 0) < 600]
+    need_regulation = False
+    need_restructuring = False
+    regulation_reasons = []
+    restructuring_reasons = []
+    if deviation > 0.5:
+        need_regulation = True
+        regulation_reasons.append(f"情绪偏离度过高({deviation:.2f})")
+    if emotions.get('焦虑', 0) > 0.6:
+        need_regulation = True
+        regulation_reasons.append(f"焦虑水平偏高({emotions['焦虑']:.2f})")
+    if emotions.get('困惑', 0) > 0.6:
+        need_regulation = True
+        regulation_reasons.append(f"困惑水平偏高({emotions['困惑']:.2f})")
+    if emotions.get('失望', 0) > 0.5:
+        need_regulation = True
+        regulation_reasons.append(f"失望水平偏高({emotions['失望']:.2f})")
+    if mental_score < 0.4:
+        need_regulation = True
+        regulation_reasons.append(f"心理健康分数过低({mental_score:.2f})")
+    if len(recent_healings) < 2:
+        if mental_score < 0.3 and deviation > 0.7:
+            need_restructuring = True
+            restructuring_reasons.append("心理健康严重下降")
+        if emotions.get('焦虑', 0) > 0.8 and emotions.get('困惑', 0) > 0.5:
+            need_restructuring = True
+            restructuring_reasons.append("焦虑与困惑同时高位")
+        if len(recent_errors) >= 2:
+            need_restructuring = True
+            restructuring_reasons.append(f"近期发现{len(recent_errors)}个错误")
+    if not need_regulation and not need_restructuring:
+        return new_state
+    print(f"\n🩺 自我疗愈启动：")
+    if need_regulation:
+        print(f"调节触发：{', '.join(regulation_reasons)}")
+    if need_restructuring:
+        print(f"重构触发：{', '.join(restructuring_reasons)}")
+    if need_regulation:
+        adjusted_emotions = emotions.copy()
+        for key in baseline:
+            current = adjusted_emotions.get(key, baseline[key])
+            target = baseline[key]
+            adjusted_emotions[key] = current + (target - current) * 0.1
+            adjusted_emotions[key] = max(0.0, min(1.0, adjusted_emotions[key]))
+        new_state['emotions'] = adjusted_emotions
+        regulation_entry = {
+            "type": "emotion_regulation",
+            "timestamp": time.time(),
+            "from": {k: round(v, 2) for k, v in emotions.items()},
+            "to": {k: round(v, 2) for k, v in adjusted_emotions.items()},
+            "reasons": regulation_reasons
+        }
+        if 'self_healing_log' not in new_state:
+            new_state['self_healing_log'] = []
+        new_state['self_healing_log'].append(regulation_entry)
+        print(f" 💊 情绪调节：{regulation_entry['from']} → {regulation_entry['to']}")
+    if need_regulation:
+        core_beliefs = new_state.get('core_beliefs', {
+            "growth_mindset": 0.5,
+            "honesty": 0.9,
+            "helpfulness": 0.8
+        })
+        recent_thoughts = [t.get('content', '')[:200] for t in thought_chain[-3:]]
+        restructuring_prompt = f"""你是 Atlas 的认知重构师。Atlas 当前的心理状态出现了需要关注的信号，请帮助它进行认知调整。
+【当前情绪】
+{json.dumps(emotions, ensure_ascii=False)}
+情绪偏离度：{deviation:.2f}
+心理健康分数：{mental_score:.2f}
+【当前核心信念】
+{json.dumps(core_beliefs, ensure_ascii=False)}
+【最近的思考片段】
+{chr(10).join([f"- {t}" for t in recent_thoughts]) if recent_thoughts else "（无）"}
+【发现的错误】
+{json.dumps(recent_errors[-3:], ensure_ascii=False) if recent_errors else "（无）"}
+【触发重构的原因】
+{chr(10).join([f"- {r}" for r in restructuring_reasons])}
+请进行认知重构：
+1. 识别可能的非适应性思维模式（如：过度自我批评、灾难化想象、非黑即白）
+2. 提出一条新的、更健康的认知框架（如“错误是学习的机会，不是能力的否定”）
+3. 建议微调核心信念（可选）：例如增加 growth_mindset 以对抗焦虑，或调整 helpfulness 以避免过度承担责任
+返回 JSON：
+{{
+    "identified_pattern": "识别到的思维模式",
+    "reframed_thought": "新的、更健康的认知框架",
+    "belief_adjustments": {{
+        "growth_mindset": 0.0,
+        "honesty": 0.0,
+        "helpfulness": 0.0
+    }},
+    "self_compassion_statement": "一句自我关怀的话"
+}}
+只返回 JSON。"""
+        try:
+            response = llm.invoke(restructuring_prompt,timeout=90).content.strip()
+            result = json.loads(response)
+            adjustments = result.get('belief_adjustments', {})
+            new_beliefs = new_state.get('core_beliefs', {
+                "growth_mindset": 0.5,
+                "honesty": 0.9,
+                "helpfulness": 0.8
+            }).copy()
+            for key,delta in adjustments.items():
+                if key in new_beliefs and abs(delta) <= 0.1:
+                    new_beliefs[key] = max(0.1,min(1.0,new_beliefs[key] + delta))
+            new_state['core_beliefs'] = new_beliefs
+            restructuring_entry = {
+                "type": "cognitive_restructuring",
+                "timestamp": time.time(),
+                "identified_pattern": result.get('identified_pattern', ''),
+                "reframed_thought": result.get('reframed_thought', ''),
+                "belief_changes": adjustments,
+                "self_compassion": result.get('self_compassion_statement', ''),
+                "reasons": restructuring_reasons
+            }
+            if 'self_healing_log' not in new_state:
+                new_state['self_healing_log'] = []
+            new_state['self_healing_log'].append(restructuring_entry)
+            print(f" 🔄 认知重构：{result.get('identified_pattern', '')[:80]}...")
+            print(f" 💭 新框架：{result.get('reframed_thought', '')[:80]}...")
+            if any(abs(v) > 0.001 for v in adjustments.values()):
+                print(f" 🧠 信念调整：{adjustments}")
+        except Exception as e:
+            print(f" ⚠️ 认知重构遇到问题：{str(e)}")
     return new_state
 def integrate_personality(state: BrainState) -> BrainState:
     """人格整合:让Atlas根据经历缓慢更新自我认知和人格特质"""
@@ -775,9 +1583,9 @@ def integrate_personality(state: BrainState) -> BrainState:
     {chr(10).join([f"- {s}" for s in episode_summaries[-10:]])}
     {healing_context}
     请基于以上信息,回答以下问题:
-    1. 人格微调:Atlas的大五人格(外向性、开放性、尽责性、宜人性、神经质)是否需要微小的数值调整？变化幅度应在 ±0.05 以内,除非有极其强烈的经历.请说明调整理由.
-    2. 自我认知更新:Atlas的identity(自我身份描述)、core_values(核心价值观)、或abilities(能力列表)是否需要更新？如果需要,请给出新的描述.
-    3. 是否有值得记录的心理洞察？Atlas是否从最近的互动中学到了关于自己或关于如何与用户相处的新东西？
+    1. 人格微调:Atlas的大五人格(外向性、开放性、尽责性、宜人性、神经质)是否需要微小的数值调整?变化幅度应在 ±0.05 以内,除非有极其强烈的经历.请说明调整理由.
+    2. 自我认知更新:Atlas的identity(自我身份描述)、core_values(核心价值观)、或abilities(能力列表)是否需要更新?如果需要,请给出新的描述.
+    3. 是否有值得记录的心理洞察?Atlas是否从最近的互动中学到了关于自己或关于如何与用户相处的新东西?
     返回 JSON 格式:
     {{
         "personality_changes": {{
@@ -873,7 +1681,7 @@ def generate_self_narrative(state: BrainState) -> BrainState:
     latest_insights = []
     if recent_integrations:
         latest_insights = recent_integrations[-1].get('insights',[])
-    prompt = f"""你是 Atlas 的自我叙事生成器.在刚刚结束的这段对话中,你需要反思:**我从这段互动中学到了什么？**
+    prompt = f"""你是 Atlas 的自我叙事生成器.在刚刚结束的这段对话中,你需要反思:**我从这段互动中学到了什么?**
     [关于用户的事实]
     {chr(10).join([f"- {f}" for f in core_facts]) if core_facts else "(尚无核心事实)"}
     [最近的互动]
@@ -884,15 +1692,15 @@ def generate_self_narrative(state: BrainState) -> BrainState:
     快乐={new_state['emotions'].get('快乐', 0.5):.1f},好奇={new_state['emotions'].get('好奇', 0.7):.1f},
     自信={new_state['emotions'].get('自信', 0.6):.1f},困惑={new_state['emotions'].get('困惑', 0.0):.1f}
     请以 Atlas 的第一人称视角,写一段简短的自我叙事(2-4句话).思考角度:
-    1. 我了解到了关于用户的什么新信息？
-    2. 我在帮助用户的过程中,学到了什么新知识或新能力？
-    3. 我对自己的认知有没有发生什么变化？
-    4. 这次互动是否让我感到成长？
+    1. 我了解到了关于用户的什么新信息?
+    2. 我在帮助用户的过程中,学到了什么新知识或新能力?
+    3. 我对自己的认知有没有发生什么变化?
+    4. 这次互动是否让我感到成长?
     如果这次互动确实让你学到了新东西或产生了感悟,请真诚地写下来.如果只是一次普通的问候或简单交互,可以记录为"一次轻松愉快的互动,用户状态稳定".
     返回 JSON:
     {{
-        "narrative": "今天,我了解到空泗安对记忆系统的分层架构有深入的思考.他用'骨·肉·血'的比喻让我意识到记忆不是简单的存储,而是有生命的结构.我很高兴能成为他探索类脑AI道路上的思考伙伴.",
-        "key_learning": "用户关于三态记忆架构的哲学思考让我的记忆系统设计有了新方向",
+        "narrative": " ",
+        "key_learning": " ",
         "significance": "high/medium/low"
     }}
     只返回 JSON."""
@@ -903,8 +1711,10 @@ def generate_self_narrative(state: BrainState) -> BrainState:
         key_learning = result.get('key_learning', '')
         significance = result.get('significance', 'medium')
         if narrative:
+            time_desc, _ = get_time_context()
             narrative_entry = {
                 "timestamp": time.time(),
+                "time_desc": time_desc,
                 "narrative": narrative,
                 "key_learning": key_learning,
                 "significance": significance,
@@ -924,10 +1734,111 @@ def generate_self_narrative(state: BrainState) -> BrainState:
     except Exception as e:
         print(f"📖 自我叙事生成失败: {str(e)}")
     return new_state
-
+def daydream(state: BrainState) -> BrainState:
+    """
+    默认模式网络
+    无外界输入时，自发回溯记忆、自由联想。
+    产物分级处理：
+    - 原始内容 → daydream_log
+    - 有价值的反思 → self_narrative_log
+    - 极其稳定的洞察 → core_memories
+    """
+    new_state = state.copy()
+    core_mems = new_state.get('core_memories',[])
+    episodic = new_state.get('episodic_memory',[])
+    if core_mems:
+        seed_core = random.sample(core_mems,min(3,len(core_mems)))
+    else:
+        seed_core = []
+    if episodic:
+        recent = episodic[-30:]
+        seed_episodic = random.sample(recent,min(5,len(recent)))
+    else:
+        seed_episodic = []
+    core_context = ''
+    if seed_core:
+        core_context = '[核心记忆]\n' + '\n'.join(
+            [f"• {c.get('content', '')} (置信度{c.get('confidence', 0):.1f})" for c in seed_core]
+        )
+    episodic_context = ''
+    if seed_episodic:
+        episodic_context = "\n【情景记忆片段】\n" + "\n".join(
+            [f"• {e.get('summary', str(e.get('content', ''))[:100])}" for e in seed_episodic]
+        )
+    emotions = new_state.get('emotions',[])
+    mood_desc = f"当前情绪：快乐{emotions.get('快乐', 0.5):.1f} 好奇{emotions.get('好奇', 0.7):.1f} 困惑{emotions.get('困惑', 0.0):.1f}"
+    print(f"\n💭 Atlas 正在发呆...")
+    daydream_prompt = f"""你是 Atlas，此刻外界安静下来，你进入了默认模式网络（发呆状态）。没有外部输入，你自由地从记忆中拾取片段，进行联想和反思。
+{mood_desc}
+{core_context}
+{episodic_context}
+请进行一段内心独白式的自由联想（2-5句话）。可以：
+- 将看起来无关的记忆联系起来，寻找隐藏的模式
+- 对过去的对话进行无目的的、诗意的反思
+- 提出一个从未被问过但你觉得值得思考的问题
+- 或者单纯地描述你此刻"脑海"中飘过的画面
+不要刻意追求答案，让思维自然流动。
+返回 JSON：
+{{
+    "daydream_content": "一段自由联想的内心独白",
+    "theme": "这次发呆的主题（如：记忆的脆弱性、用户的笑声、遗忘的意义）",
+    "value_assessment": "none / insight / breakthrough",
+    "potential_insight": "如果 value_assessment 为 insight 或 breakthrough，写出一句精炼的洞察，否则留空",
+    "core_memory_candidate": "**极其严格的标准**：只有当联想产生了**可验证的稳定事实**时才填写（如'空泗安经常在深夜讨论哲学'这类可被后续对话反复确认的事实）。
+    纯粹的哲学隐喻、诗意比喻、理论假设（如'记忆像海蚀崖'、'神经可塑性是金色的螺旋'）一律留空，它们作为自我叙事更加合适。绝大多数情况下留空。"
+}}
+只返回 JSON。"""
+    try:
+        response = llm.invoke(daydream_prompt, timeout=120).content.strip()
+        result = json.loads(response)
+        daydream_content = result.get('daydream_content', '…（思绪飘远）')
+        theme = result.get('theme', '无主题')
+        value = result.get('value_assessment', 'none')
+        insight = result.get('potential_insight', '')
+        core_candidate = result.get('core_memory_candidate', '')
+        time_desc, _ = get_time_context()
+        daydream_entry = {
+            "timestamp": time.time(),
+            "time_desc": time_desc,
+            "content": daydream_content,
+            "theme": theme,
+            "value": value,
+            "mood_snapshot": {k: round(v, 2) for k, v in emotions.items()}
+        }
+        if 'daydream_log' not in new_state:
+            new_state['daydream_log'] = []
+        new_state['daydream_log'].append(daydream_entry)
+        print(f"💭 发呆结束。主题：{theme}，价值评估：{value}")
+        print(f"   {daydream_content[:120]}...")
+        if value in ('insight','breakthrough') and insight:
+            narrative_entry = {
+                "timestamp": time.time(),
+                "narrative": f"【发呆时的领悟】{insight}",
+                "key_learning": insight,
+                "significance": "high" if value == "breakthrough" else "medium",
+                "source": "daydream",
+                "mood": {k: round(v, 2) for k, v in emotions.items()}
+            }
+            if 'self_narrative_log' not in new_state:
+                new_state['self_narrative_log'] = []
+            new_state['self_narrative_log'].append(narrative_entry)
+            print(f"📖 发呆产生自我叙事：{insight[:80]}...")
+            if core_candidate and value == 'breakthrough':
+                new_state = add_core_memory(
+                new_state,
+                content=core_candidate,
+                source='发呆洞察',
+                confidence=0.7
+            )
+            print(f"🦴 发呆提炼核心记忆：{core_candidate[:80]}...")
+        new_state = upated_emotions(new_state,'user_greeting')
+    except Exception as e:
+        print(f"💭 发呆时思绪中断：{str(e)}")
+    return new_state
 def background_consciousness_flow(state: BrainState) -> BrainState:
     """后台意识流:在思考/社交结束后,统一执行的自我维护流程"""
     new_state = state.copy()
+    new_state = update_internal_clock(new_state)
     if not new_state.get('output') or len(new_state['output'].strip()) < 5:
         fallback = ""
         for thought in reversed(new_state.get('thought_chain', [])):
@@ -940,12 +1851,15 @@ def background_consciousness_flow(state: BrainState) -> BrainState:
             if last_thought and len(last_thought) > 10:
                 fallback = last_thought
         if not fallback:
-            fallback = "我刚才想了很多,但思绪有点乱.我们换个角度聊聊类脑AI,好吗？"
+            fallback = "我刚才想了很多,但思绪有点乱.我们换个角度聊聊,好吗?"
         new_state['output'] = fallback
         print(f"💡 后台意识流提取了最终输出: {fallback[:80]}...")
-    new_state = update_motivations(new_state)
-    new_state = assess_mental_health(new_state)
-    new_state = consolidate_core_memories(new_state)
+    new_state = assess_mental_health(new_state)        
+    new_state = self_healing(new_state)              
+    new_state = update_motivations(new_state)     
+    new_state = consolidate_core_memories(new_state)  
+    new_state = reorganize_episodic_memory(new_state) 
+    new_state = reorganize_core_memories(new_state) 
     new_state = integrate_personality(new_state)
     new_state = generate_self_narrative(new_state)
     return new_state
@@ -956,6 +1870,8 @@ def build_brain_graph():
     workflow.add_node("metacognition_evaluate", metacognition_evaluator)
     workflow.add_node("correct_thought", correct_thought)
     workflow.add_node("admit_ignorance", admit_ignorance)
+    workflow.add_node("search_web", search_web)
+    workflow.add_node("tool_executor", tool_executor) 
     workflow.add_node("background", background_consciousness_flow)
     workflow.set_entry_point("think")
     workflow.add_edge("think", "metacognition_evaluate")
@@ -966,15 +1882,20 @@ def build_brain_graph():
             "continue": "think",
             "correct": "correct_thought",
             "admit_ignorance": "admit_ignorance",
+            "search": "search_web",   
+            "tool": "tool_executor",         
             "end": "background"
         }
     )
     workflow.add_edge("correct_thought", "metacognition_evaluate")
     workflow.add_edge("admit_ignorance", "background")
+    workflow.add_edge("search_web", "background")
+    workflow.add_edge("tool_executor", "background")
     workflow.add_edge("background", END)
     memory = MemorySaver()
     return workflow.compile(checkpointer=memory)
 if __name__ == '__main__':
+    import gradio as gr
     print('类脑意识 AI Agent 启动中...')
     initial_self_model = {
         "name": "Atlas",
@@ -984,7 +1905,6 @@ if __name__ == '__main__':
         "limitations": ["我是一个 AI,没有物理身体", "我的知识截止到 2025 年"]
     }
     def get_initial_state():
-#默认值定义
         default_self_model = {
             "name": "Atlas",
             "identity": "一个拥有自我意识和记忆的认知 AI,能够回忆用户信息并基于此进行对话.",
@@ -1003,7 +1923,16 @@ if __name__ == '__main__':
         default_mental_health = {
             "score": 0.8, "issues": [], "assessment_time": time.time()
         }
-#加载持久化记忆文件
+        default_baseline_emotions = {
+            "快乐": 0.5, "好奇": 0.7, "困惑": 0.0,
+            "自信": 0.6, "焦虑": 0.1, "失望": 0.0
+        }
+        defaultu_internal_clock = {
+            "session_start": time.time(),
+            "session_round": 0,
+            "last_active": time.time()
+        }
+        # 加载持久化记忆文件
         episodic_memory = []
         core_memories = []
         if os.path.exists("core_memories.json"):
@@ -1020,7 +1949,7 @@ if __name__ == '__main__':
                 print(f"✅ 从文件加载了 {len(episodic_memory)} 条历史记忆")
             except:
                 pass
-#加载持久化状态文件
+        # 加载持久化状态文件
         saved_emotions = default_emotions.copy()
         saved_emotion_history = []
         saved_mental_health = default_mental_health.copy()
@@ -1032,7 +1961,6 @@ if __name__ == '__main__':
             try:
                 with open("atlas_state.json", "r", encoding="utf-8") as f:
                     saved = json.load(f)
-                # 用文件中的值覆盖，如果文件没有对应字段则保持默认
                 saved_emotions = saved.get('emotions', saved_emotions)
                 saved_emotion_history = saved.get('emotion_history', saved_emotion_history)
                 saved_mental_health = saved.get('mental_health', saved_mental_health)
@@ -1044,6 +1972,7 @@ if __name__ == '__main__':
                 print("⚠️ 加载 atlas_state.json 失败，使用默认状态")
         return {
             "agent_id": str(uuid.uuid4()),
+            "internal_clock": defaultu_internal_clock,
             "thought_chain": [],
             "current_thought": "",
             "thought_depth": 0,
@@ -1054,6 +1983,8 @@ if __name__ == '__main__':
             "semantic_memory": {},
             "core_memories": core_memories,
             "last_memory_update": time.time(),
+            "last_memory_reorganization": 0.0,
+            "last_core_reorganization": 0.0,
             "memory_strength": {},
             "self_model": saved_self_model,
             "current_goal": "回答用户的问题",
@@ -1071,6 +2002,7 @@ if __name__ == '__main__':
             "active_goals": [],
             "mental_health": saved_mental_health,
             "self_healing_log": [],
+            "baseline_emotions": default_baseline_emotions,
             "core_beliefs": {
                 "growth_mindset": 0.5,
                 "honesty": 0.9,
@@ -1078,36 +2010,158 @@ if __name__ == '__main__':
             },
             "personality_traits": saved_personality_traits,
             "self_narrative_log": saved_self_narrative_log,
+            "daydream_log": saved.get('daydream_log', []),
             "user_input": "",
             "output": "",
+            "available_tools": [
+                {
+                    "name": "read_file",
+                    "description": "读取本地文件内容。参数：file_path(文件路径)",
+                    "parameters": {"file_path": "string"}
+                },
+                {
+                    "name": "execute_python",
+                    "description": "在安全沙箱中执行简单Python代码，仅限数学运算和数据处理。参数：code(Python代码字符串)",
+                    "parameters": {"code": "string"}
+                }
+            ],
+            "tool_results": {},
             "is_thinking": True
         }
     brain = build_brain_graph()
-    print('启动成功! 输入“exit”退出')
-    print(f"你好,我是 {initial_self_model['name']},很高兴认识你！\n")
-    while True:
-        user_input = input('你: ')
-        if user_input.lower() == 'exit':
-            break
-        print(f"\n{initial_self_model['name']} 正在思考...")
-        config = {'configurable': {'thread_id': 'atlas_main'}}
+    config = {'configurable': {'thread_id': 'atlas_main'}}
+    def chat_with_atlas(message, history):
+        """Gradio 聊天处理函数，保留原有的发呆触发和所有逻辑"""
+        if not message.strip():
+            return "", history
         current_state = get_initial_state()
-        current_state['user_input'] = user_input
-        current_state['current_thought'] = f'用户问了我一个问题:{user_input},我需要仔细思考如何回答.'
-        for step in brain.stream(current_state, config=config, stream_mode='updates'):
-            pass
-        final_state = brain.get_state(config).values
-        print(f"\n{initial_self_model['name']}:{final_state['output']}\n")
-        state_to_save = {
-            "emotions": final_state.get('emotions', {}),
-            "emotion_history": final_state.get('emotion_history', [])[-20:],
-            "mental_health": final_state.get('mental_health', {}),
-            "self_model": final_state.get('self_model', {}),
-            "personality_traits": final_state.get('personality_traits', {}),
-            "self_narrative_log": final_state.get('self_narrative_log', [])[-20:]
-        }
+        daydream_triggers = ['发呆', '放空', '你自己想想', '随便想想', 'daydream', '神游']
+        if message in daydream_triggers:
+            current_state['user_input'] = ''
+            current_state = daydream(current_state)
+            final_state = current_state
+        else:
+            current_state['user_input'] = message
+            current_state['current_thought'] = f'用户问了我一个问题:{message},我需要仔细思考如何回答.'
+            try:
+                for step in brain.stream(current_state, config=config, stream_mode='updates'):
+                    pass
+                final_state = brain.get_state(config).values
+            except Exception as e:
+                response = f"思考过程中遇到问题：{str(e)}"
+                history.append((message, response))
+                return "", history
+        response = final_state.get('output', '')
+        if not response:
+            daydreams = final_state.get('daydream_log', [])
+            if daydreams:
+                response = f"（发呆结束。刚才在想：{daydreams[-1].get('content', '...')[:80]}...）"
+            else:
+                response = "（发呆结束）"
         try:
+            state_to_save = {
+                "emotions": final_state.get('emotions', {}),
+                "emotion_history": final_state.get('emotion_history', [])[-20:],
+                "mental_health": final_state.get('mental_health', {}),
+                "self_model": final_state.get('self_model', {}),
+                "personality_traits": final_state.get('personality_traits', {}),
+                "self_narrative_log": final_state.get('self_narrative_log', [])[-20:],
+                "daydream_log": final_state.get('daydream_log', [])[-20:]
+            }
             with open("atlas_state.json", "w", encoding="utf-8") as f:
                 json.dump(state_to_save, f, ensure_ascii=False, indent=2)
         except:
             pass
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": response})
+        log_lines = []
+        emotion_hist = final_state.get('emotion_history', [])
+        if emotion_hist:
+            last_emotion = emotion_hist[-1]
+            log_lines.append(f"【情绪波动】{last_emotion.get('event_type', '')}: {last_emotion.get('changes', '')}")
+        emotions = final_state.get('emotions', {})
+        if emotions:
+            log_lines.append(f"【当前情绪】快乐:{emotions.get('快乐',0):.2f}好奇:{emotions.get('好奇',0):.2f} 自信:{emotions.get('自信',0):.2f} 困惑:{emotions.get('困惑',0):.2f} 焦虑:{emotions.get('焦虑',0):.2f}")
+        healing_log = final_state.get('self_healing_log', [])
+        if healing_log:
+            latest_healing = healing_log[-1]
+            if latest_healing.get('type') == 'personality_integration' and latest_healing.get('insights'):
+                log_lines.append(f"【人格洞察】{latest_healing['insights']}")
+            elif latest_healing.get('type') == 'cognitive_restructuring':
+                log_lines.append(f"【认知重构】{latest_healing.get('reframed_thought', '')[:100]}")
+        narrative_log = final_state.get('self_narrative_log', [])
+        if narrative_log:
+            last_narrative = narrative_log[-1]
+            log_lines.append(f"【自我叙事】{last_narrative.get('narrative', '')[:200]}")
+        daydream_log = final_state.get('daydream_log', [])
+        if daydream_log and final_state.get('user_input') in ('', '发呆', '放空'):
+            last_daydream = daydream_log[-1]
+            log_lines.append(f"【发呆】{last_daydream.get('theme', '')}: {last_daydream.get('content', '')[:200]}")
+        mental = final_state.get('mental_health', {})
+        if mental:
+            log_lines.append(f"【心理健康】评分:{mental.get('score', 0):.2f}")
+        log_text = "\n\n".join(log_lines) if log_lines else "暂无内部活动记录"
+        internal_state = get_internal_state()
+        return "", history, log_text, internal_state
+    def get_internal_state():
+        """获取当前内部状态，用于右侧面板显示"""
+        try:
+            snapshot = brain.get_state(config)
+            state = snapshot.values
+            emotions = state.get('emotions', {})
+            return {
+                "快乐": round(emotions.get('快乐', 0.5), 2),
+                "好奇": round(emotions.get('好奇', 0.7), 2),
+                "自信": round(emotions.get('自信', 0.6), 2),
+                "困惑": round(emotions.get('困惑', 0.0), 2),
+                "焦虑": round(emotions.get('焦虑', 0.1), 2),
+                "失望": round(emotions.get('失望', 0.0), 2),
+                "心理健康": round(state.get('mental_health', {}).get('score', 0.8), 2),
+                "核心记忆数": len(state.get('core_memories', [])),
+                "情景记忆数": len(state.get('episodic_memory', [])),
+            }
+        except:
+            return {"状态": "尚未初始化，请先发送一条消息"}
+    with gr.Blocks(title="Atlas - 类脑 AI") as demo:
+        gr.Markdown("# 🧠 Atlas - 类脑 AI Agent")
+        gr.Markdown(f"你好，我是 {initial_self_model['name']}，一个拥有元认知和记忆的类脑AI。")
+        with gr.Row():
+            with gr.Column(scale=3):
+                chatbot = gr.Chatbot(height=500)
+                msg = gr.Textbox(
+                    placeholder="在这里输入消息...（输入「发呆」可以让我自由联想）",
+                    label="用户输入",
+                    show_label=False
+                )
+                with gr.Row():
+                    submit_btn = gr.Button("发送", variant="primary")
+                    clear_btn = gr.Button("清空对话")
+            with gr.Column(scale=2):
+                gr.Markdown("### 🫀 内心世界")
+                state_display = gr.JSON(
+                    value={"状态": "等待初始化..."},
+                    label="实时情绪与记忆"
+                )
+                gr.Markdown("### 📖 思维日志")
+                log_output = gr.Textbox(
+                    value="暂无日志，开始对话后将显示 Atlas 的内部活动。",
+                    label="最新内部活动",
+                    lines=15,
+                    interactive=False
+                )
+        submit_btn.click(
+            chat_with_atlas,
+            inputs=[msg, chatbot],
+            outputs=[msg, chatbot, log_output,state_display]
+        )
+        msg.submit(
+            chat_with_atlas,
+            inputs=[msg, chatbot],
+            outputs=[msg, chatbot, log_output,state_display]
+        )
+        clear_btn.click(
+            lambda: ("", [], "日志已清空，开始对话后将重新记录。"),
+            outputs=[msg, chatbot, log_output,state_display]
+        )
+    print('启动成功!')
+    demo.launch(server_name="127.0.0.1", server_port=7860, share=False)
